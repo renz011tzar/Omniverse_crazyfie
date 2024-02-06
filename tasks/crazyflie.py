@@ -43,7 +43,7 @@ EPS = 1e-6  # small constant to avoid divisions by 0 and log(0)
 class CrazyflieTask(RLTask):
     def __init__(self, name, sim_config, env, offset=None) -> None:
         self.update_config(sim_config)
-        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
         self._num_observations = 18
         self._num_actions = 4
 
