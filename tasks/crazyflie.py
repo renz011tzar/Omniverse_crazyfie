@@ -43,15 +43,14 @@ EPS = 1e-6  # small constant to avoid divisions by 0 and log(0)
 class CrazyflieTask(RLTask):
     def __init__(self, name, sim_config, env, offset=None) -> None:
         self.update_config(sim_config)
-
+        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self._num_observations = 18
         self._num_actions = 4
 
         self._crazyflie_position = torch.tensor([0, 0, 1.0])
-        self._ball_position = torch.tensor([0, 0, 1.0], device=self._device)
-        self.spin_counter = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
-        self.is_spinning = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
-        self.last_yaw_velocity = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._ball_position = torch.tensor([0, 0, 1.0])
+        self.phase = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
+        self.spin_count = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
 
         RLTask.__init__(self, name=name, env=env)
 
@@ -274,8 +273,9 @@ class CrazyflieTask(RLTask):
 
         torch_zeros = lambda: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.episode_sums = {
-            "rew_spin": torch_zeros(),
-            "rew_hover": torch_zeros(),
+            "rew_pos": torch.zeros(self._num_envs, device=self._device),
+            "rew_hover": torch.zeros(self._num_envs, device=self._device),
+            "rew_spin": torch.zeros(self._num_envs, device=self._device),
             "raw_dist": torch_zeros(),
             "raw_orient": torch_zeros(),
             "raw_effort": torch_zeros(),
@@ -311,6 +311,8 @@ class CrazyflieTask(RLTask):
 
     def reset_idx(self, env_ids):
         num_resets = len(env_ids)
+        self.phase.fill_(0)
+        self.spin_count.fill_(0)
 
         self.dof_pos[env_ids, :] = torch_rand_float(-0.0, 0.0, (num_resets, self._copters.num_dof), device=self._device)
         self.dof_vel[env_ids, :] = 0
@@ -342,100 +344,80 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def check_if_spinning(self, idx):
-        """
-        A drone is considered to be spinning if its yaw angular velocity is above a certain threshold.
-        """
-        angular_velocity_threshold = 0.5  # Define a suitable threshold based on your simulation dynamics
-        yaw_velocity = self.root_velocities[idx, -1]  # Assuming the last component is the yaw velocity
-        return abs(yaw_velocity) > angular_velocity_threshold
+    def calculate_dual_position(self, idx, center):
+        # Calculate the vector from the center to the drone's current position
+        vector_center_to_drone = self.root_pos[idx] - center
 
-    def check_if_opposite_and_inverted_spin(self, idx):
-        """
-        Check if the drone, after starting a spin, has passed the opposite side of the ball with an
-        angular velocity in the opposite direction, indicating a half spin completion.
-        """
-        # Assumption: Ball is at the origin or its position is known and stored in self._ball_position
-        ball_position = self._ball_position  # Update this based on how ball position is stored
+        # Calculate the true distance from the drone's current position to the center
+        true_distance = torch.norm(vector_center_to_drone)
 
-        drone_position = self.root_pos[idx]
-        drone_to_ball_vector = drone_position - ball_position
-        drone_to_ball_distance = torch.norm(drone_to_ball_vector)
+        # Calculate the distance from the center to the dual position
+        distance_center_to_dual = 4.0 / true_distance
 
-        # Check if the drone is approximately above the ball
-        vertical_threshold = 0.2  # Adjust based on your simulation's scale
-        is_above_ball = drone_to_ball_distance < vertical_threshold
+        # Normalize the vector from the center to the drone to get the direction
+        direction = vector_center_to_drone / true_distance
 
-        # Check for inversion in yaw velocity indicating a half spin
-        yaw_velocity = self.root_velocities[idx, -1]  # Assuming the last component is the yaw velocity
-        inverted_spin = yaw_velocity * self.last_yaw_velocity[idx] < 0
+        # Calculate the dual position by extending the vector from the center in the direction of the drone
+        dual_position = center + direction * distance_center_to_dual
 
-        return is_above_ball and inverted_spin
+        return dual_position
+    
+
 
     def calculate_metrics(self) -> None:
-        root_positions = self.root_pos - self._env_pos
-        root_quats = self.root_rot
-        root_angvels = self.root_velocities[:, 3:]
-        spin_reward_total = 0.0
-        hover_reward_total = 0.0
-
-
-        # pos reward
-        target_dist = torch.sqrt(torch.square(self.target_positions - root_positions).sum(-1))
-        self.target_dist = target_dist
-        self.root_positions = root_positions
-
-        # orient reward
-        ups = quat_axis(root_quats, 2)
-        self.orient_z = ups[..., 2]
-
-        # effort reward
-        effort = torch.square(self.actions).sum(-1)
-
-        # spin reward
-        spin = torch.square(root_angvels).sum(-1)
+        # Reset reward buffer and other accumulators at the start of each metric calculation
+        self.rew_buf[:] = 0
+        pos_reward = torch.zeros(self._num_envs, device=self._device)
+        hover_reward = torch.zeros(self._num_envs, device=self._device)
+        dual_reward = torch.zeros(self._num_envs, device=self._device)
 
         for i in range(self._num_envs):
-        # Check if the drone is currently spinning
-            if not self.is_spinning[i] and self.check_if_spinning(i):
-                self.is_spinning[i] = True  # Mark the drone as spinning
+            # Common calculations for all stages
+            center = torch.tensor([0, 0, 1], device=self._device) if self.spin_count[i] % 2 == 0 else torch.tensor([0, 0, -1], device=self._device)
+            distance_to_center = torch.norm(self.root_pos[i] - center)
 
-            # Once spinning, check if the drone completes a half spin
-            elif self.is_spinning[i] and self.check_if_opposite_and_inverted_spin(i):
-                self.is_spinning[i] = False  # Reset spinning state for the next detection
-                self.spin_counter[i] += 1  # Increment the spin counter
+            # Stage 1: Reach above the ball at [0, 0, 1]
+            if self.phase[i] == 0:
+                pos_reward[i] = 1.0 / (1.0 + distance_to_center)
+                if distance_to_center < 0.1:
+                    self.phase[i] = 1  # Transition to Stage 2
 
-                # Add half-spin reward to the total spin reward
-                if self.spin_counter[i] < 4:
-                    spin_reward = 0.5 * (self.spin_counter[i] % 2)
-                    self.rew_buf[i] += spin_reward
-                    spin_reward_total += spin_reward
+            # Stage 2: Spin and hover, alternating centers
+            elif self.phase[i] == 1 and self.spin_count[i] < 4:
+                hover_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Heavier reward for hovering
+                dual_position = self.calculate_dual_position(i, center)
+                dual_center = -center  # Assuming dual_center logic as per your instructions
+                distance_to_dual = torch.norm(self.root_pos[i] - (dual_center + dual_position))
+                dual_reward[i] = 1.0 / (1.0 + distance_to_dual)
+                if distance_to_dual < 0.1:
+                    self.spin_count[i] += 1
 
-            # After completing 2 full spins, provide a constant reward for hovering
-            if self.spin_counter[i] >= 4:
-                hover_reward = 1.0  # Hovering reward
-                self.rew_buf[i] += hover_reward
-                hover_reward_total += hover_reward
+            # Stage 3: Hover at [0, 0, 1] after completing spins
+            elif self.phase[i] == 1 and self.spin_count[i] == 4:
+                hover_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Continue heavy reward for hovering
 
-        for i in range(self._num_envs):
-            self.last_yaw_velocity[i] = self.root_velocities[i, -1] 
-            
-        # log episode reward sums
-        self.episode_sums["rew_spin"] += spin_reward_total
-        self.episode_sums["rew_hover"] += hover_reward_total
+        # Accumulate rewards in the buffer
+        self.rew_buf[:] = pos_reward + hover_reward + dual_reward
 
-        # log raw info
-        self.episode_sums["raw_dist"] += target_dist
-        self.episode_sums["raw_orient"] += ups[..., 2]
-        self.episode_sums["raw_effort"] += effort
-        self.episode_sums["raw_spin"] += spin
+        # Update episode sums for logging
+        self.episode_sums["rew_pos"] += pos_reward.sum()
+        self.episode_sums["rew_hover"] += hover_reward.sum()
+        self.episode_sums["rew_spin"] += dual_reward.sum()
 
 
     def is_done(self) -> None:
-        # resets due to misbehavior
+        # Resets due to misbehavior
         ones = torch.ones_like(self.reset_buf)
         die = torch.zeros_like(self.reset_buf)
+
+        # Example condition: Drone strays too far from the target
         die = torch.where(self.target_dist > 5.0, ones, die)
 
-        # resets due to episode length
+        # Example condition: Drone's altitude drops below a threshold (e.g., crash or too low)
+        die = torch.where(self.root_positions[..., 2] < 0.5, ones, die)
+
+        # Example condition: Drone's altitude exceeds a threshold (e.g., too high)
+        die = torch.where(self.root_positions[..., 2] > 5.0, ones, die)
+
+        # Resets due to episode length
         self.reset_buf[:] = torch.where(self.progress_buf >= self._max_episode_length - 1, ones, die)
