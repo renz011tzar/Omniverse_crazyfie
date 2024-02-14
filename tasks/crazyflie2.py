@@ -50,7 +50,6 @@ class CrazyflieTask(RLTask):
         self._crazyflie_position = torch.tensor([0, 0, 1.0])
         self._ball_position = torch.tensor([0, 0, 1.0])
         self.phase = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
-        self.spin_count = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
         self.lambda_param = 5.0
 
         RLTask.__init__(self, name=name, env=env)
@@ -312,17 +311,17 @@ class CrazyflieTask(RLTask):
         self.dof_pos[env_ids, :] = torch_rand_float(-0.0, 0.0, (num_resets, self._copters.num_dof), device=self._device)
         self.dof_vel[env_ids, :] = 0
 
+        # Set a fixed initial position for the drone at (0, 0, 1)
+        fixed_position = torch.tensor([0.0, 0.0, 1.0], device=self._device)
         root_pos = self.initial_root_pos.clone()
-        root_pos[env_ids, 0] += torch_rand_float(-0.0, 0.0, (num_resets, 1), device=self._device).view(-1)
-        root_pos[env_ids, 1] += torch_rand_float(-0.0, 0.0, (num_resets, 1), device=self._device).view(-1)
-        root_pos[env_ids, 2] += torch_rand_float(-0.0, 0.0, (num_resets, 1), device=self._device).view(-1)
+        root_pos[env_ids, :] = fixed_position  # Apply fixed position to all resetting environments
+
         root_velocities = self.root_velocities.clone()
         root_velocities[env_ids] = 0
 
-        # apply resets
+        # Apply resets
         self._copters.set_joint_positions(self.dof_pos[env_ids], indices=env_ids)
         self._copters.set_joint_velocities(self.dof_vel[env_ids], indices=env_ids)
-
         self._copters.set_world_poses(root_pos[env_ids], self.initial_root_rot[env_ids].clone(), indices=env_ids)
         self._copters.set_velocities(root_velocities[env_ids], indices=env_ids)
 
@@ -339,9 +338,9 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def calculate_dual_position(self, idx, center):
+    def calculate_dual_position(self, center):
         # Calculate the vector from the center to the drone's current position
-        vector_center_to_drone = self.root_pos[idx] - center
+        vector_center_to_drone = self.root_pos - center
 
         # Calculate the true distance from the drone's current position to the center
         true_distance = torch.norm(vector_center_to_drone)
@@ -359,54 +358,45 @@ class CrazyflieTask(RLTask):
 
     def calculate_metrics(self) -> None:
         # Reset reward buffer and other accumulators at the start of each metric calculation
+        spin_count = 0
         root_positions = self.root_pos - self._env_pos
         root_quats = self.root_rot
         root_angvels = self.root_velocities[:, 3:]
-        self.rew_buf[:] = 0
-        rew_stage_1_reward = torch.zeros(self._num_envs, device=self._device)
-        rew_stage_2_reward = torch.zeros(self._num_envs, device=self._device)
-        rew_stage_3_reward = torch.zeros(self._num_envs, device=self._device)
+        rew_stage_1_reward = 0
+        rew_stage_2_reward = 0
+        rew_stage_3_reward = 0
 
         target_dist = torch.sqrt(torch.square(self.target_positions - root_positions).sum(-1))
         self.target_dist = target_dist
         self.root_positions = root_positions
 
-        for i in range(self._num_envs):
-            # Common calculations for all stages
-            center = torch.tensor([0, 0, 1], device=self._device) if self.spin_count[i] % 2 == 0 else torch.tensor([0, 0, -1], device=self._device)
-            distance_to_center = torch.norm(self.root_pos[i] - center)
+        # Desired constant distance from (0, 0, 0)
+        desired_distance = 1.0
 
-            # Stage 1: Reach above the ball at [0, 0, 1]
-            if self.phase[i] == 0:
-                distance_to_center = torch.norm(self.root_pos[i] - center)
-                rew_stage_1_reward[i] = torch.exp(-self.lambda_param * distance_to_center)
+        # Calculate the distance of each drone to (0, 0, 0)
+        distances_to_origin = torch.norm(root_positions, dim=1)
 
-                # Define your transition threshold for moving to Stage 2
-                transition_threshold = 0.1  # Adjust this value as needed for your task
-                if distance_to_center < transition_threshold:
-                    self.phase[i] = 1  # Transition to Stage 2
 
-            # Stage 2: Spin and hover, alternating centers
-            elif self.phase[i] == 1 and self.spin_count[i] < 4:
-                rew_stage_2_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Heavier reward for hovering
-                dual_position = self.calculate_dual_position(i, center)
-                dual_center = -center  # Assuming dual_center logic as per your instructions
-                distance_to_dual = torch.norm(self.root_pos[i] - (dual_center + dual_position))
-                rew_stage_2_reward[i] = rew_stage_2_reward[i]+1.0 / (1.0 + distance_to_dual)
-                if distance_to_dual < 0.1:
-                    self.spin_count[i] += 1
+        distance_deviation = torch.abs(distances_to_origin - desired_distance)
+        rew_stage_2_reward += torch.exp(-distance_deviation)  # Exponential decay reward based on distance deviation
 
-            # Stage 3: Hover at [0, 0, 1] after completing spins
-            elif self.phase[i] == 1 and self.spin_count[i] == 4:
-                rew_stage_3_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Continue heavy reward for hovering
+        center = torch.tensor([0, 0, 1], device=self._device) if spin_count % 2 == 0 else torch.tensor([0, 0, -1], device=self._device)
+        dual_position = self.calculate_dual_position(center)  # Assuming calculate_dual_position uses self.root_pos internally
+        dual_center = -center
+        distance_to_dual = torch.norm(dual_center - dual_position).sum(-1)
 
-        # Accumulate rewards in the buffer
-        self.rew_buf[:] = rew_stage_1_reward + rew_stage_2_reward + rew_stage_3_reward
+        if distance_to_dual < 0.5:
+            spin_count += 1
+
+        if spin_count < 4:
+            rew_stage_2_reward += (1.0 / (1.0 + distance_to_dual))
+
+        self.rew_buf[:] += rew_stage_2_reward
 
         # Update episode sums for logging
-        self.episode_sums["rew_stage_1"] += rew_stage_1_reward.sum()
-        self.episode_sums["rew_stage_2"] += rew_stage_2_reward.sum()
-        self.episode_sums["rew_stage_3"] += rew_stage_3_reward.sum()
+        self.episode_sums["rew_stage_1"] += rew_stage_1_reward
+        self.episode_sums["rew_stage_2"] += rew_stage_2_reward
+        self.episode_sums["rew_stage_3"] += rew_stage_3_reward
 
 
     def is_done(self) -> None:
