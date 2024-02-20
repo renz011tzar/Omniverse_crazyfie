@@ -49,8 +49,8 @@ class CrazyflieTask(RLTask):
 
         self._crazyflie_position = torch.tensor([0, 0, 1.0])
         self._ball_position = torch.tensor([0, 0, 1.0])
-        self.phase = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
-        self.spin_count = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
+        self.phase = torch.zeros(1, dtype=torch.int32, device=self._device)
+        self.spin_count = torch.zeros(1, dtype=torch.int32, device=self._device)
         self.lambda_param = 5.0
 
         RLTask.__init__(self, name=name, env=env)
@@ -339,74 +339,63 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def calculate_dual_position(self, idx, center):
-        # Calculate the vector from the center to the drone's current position
-        vector_center_to_drone = self.root_pos[idx] - center
-
-        # Calculate the true distance from the drone's current position to the center
+    def calculate_dual_position(self, center):
+        vector_center_to_drone = self.root_pos - center
         true_distance = torch.norm(vector_center_to_drone)
-
-        # Calculate the distance from the center to the dual position
-        distance_center_to_dual = 4.0 / true_distance
-
-        # Normalize the vector from the center to the drone to get the direction
         direction = vector_center_to_drone / true_distance
-
-        # Calculate the dual position by extending the vector from the center in the direction of the drone
-        dual_position = center + direction * distance_center_to_dual
-
+        dual_position = center + direction * (4.0 / true_distance)
         return dual_position
 
-    def calculate_metrics(self) -> None:
-        # Reset reward buffer and other accumulators at the start of each metric calculation
+    def calculate_metrics(self):
         root_positions = self.root_pos - self._env_pos
+        self.target_dist = torch.norm(self.target_positions - root_positions, dim=-1)
+        self.root_positions = root_positions
         root_quats = self.root_rot
         root_angvels = self.root_velocities[:, 3:]
-        self.rew_buf[:] = 0
-        rew_stage_1_reward = torch.zeros(self._num_envs, device=self._device)
-        rew_stage_2_reward = torch.zeros(self._num_envs, device=self._device)
-        rew_stage_3_reward = torch.zeros(self._num_envs, device=self._device)
 
-        target_dist = torch.sqrt(torch.square(self.target_positions - root_positions).sum(-1))
-        self.target_dist = target_dist
-        self.root_positions = root_positions
 
-        for i in range(self._num_envs):
-            # Common calculations for all stages
-            center = torch.tensor([0, 0, 1], device=self._device) if self.spin_count[i] % 2 == 0 else torch.tensor([0, 0, -1], device=self._device)
-            distance_to_center = torch.norm(self.root_pos[i] - center)
+        ball_center = torch.tensor([0, 0, 1], device=self._device)  # Center of the ball for hovering
 
-            # Stage 1: Reach above the ball at [0, 0, 1]
-            if self.phase[i] == 0:
-                distance_to_center = torch.norm(self.root_pos[i] - center)
-                rew_stage_1_reward[i] = torch.exp(-self.lambda_param * distance_to_center)
+        if self.spin_count < 4:
+            # Calculate the distance to the ball center for hovering
+            distance_to_ball_center = torch.norm(self.root_pos - ball_center)
 
-                # Define your transition threshold for moving to Stage 2
-                transition_threshold = 0.1  # Adjust this value as needed for your task
-                if distance_to_center < transition_threshold:
-                    self.phase[i] = 1  # Transition to Stage 2
+            # Sigmoid-based reward for maintaining proximity to the ball center
+            scale = 10.0
+            shift = 0
+            adjusted_distance_to_ball_center = scale * (distance_to_ball_center - shift)
+            rew_hover = 1.0 / (1.0 + torch.exp(-adjusted_distance_to_ball_center))
 
-            # Stage 2: Spin and hover, alternating centers
-            elif self.phase[i] == 1 and self.spin_count[i] < 4:
-                rew_stage_2_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Heavier reward for hovering
-                dual_position = self.calculate_dual_position(i, center)
-                dual_center = -center  # Assuming dual_center logic as per your instructions
-                distance_to_dual = torch.norm(self.root_pos[i] - (dual_center + dual_position))
-                rew_stage_2_reward[i] = rew_stage_2_reward[i]+1.0 / (1.0 + distance_to_dual)
-                if distance_to_dual < 0.1:
-                    self.spin_count[i] += 1
+            # Ensure hovering within a radius of 0.2 around the ball center
+            if distance_to_ball_center > 0.2:
+                rew_hover *= 0.1  # Penalize for being outside the desired hovering radius
 
-            # Stage 3: Hover at [0, 0, 1] after completing spins
-            elif self.phase[i] == 1 and self.spin_count[i] == 4:
-                rew_stage_3_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Continue heavy reward for hovering
+            # Calculate the dual position and its distance for controlling direction
+            center = self.root_pos
+            dual_center = ball_center - center 
+            dual_position = self.calculate_dual_position(center)
+            distance_to_dual = torch.norm(self.root_pos - (dual_center + dual_position))
 
-        # Accumulate rewards in the buffer
-        self.rew_buf[:] = rew_stage_1_reward + rew_stage_2_reward + rew_stage_3_reward
+            # Reward for the dual position to control direction, ensuring it doesn't compromise hovering
+            adjusted_distance_to_dual = scale * (distance_to_dual - shift)
+            rew_dual = 1.0 / (1.0 + torch.exp(-adjusted_distance_to_dual))
 
-        # Update episode sums for logging
-        self.episode_sums["rew_stage_1"] += rew_stage_1_reward.sum()
-        self.episode_sums["rew_stage_2"] += rew_stage_2_reward.sum()
-        self.episode_sums["rew_stage_3"] += rew_stage_3_reward.sum()
+            # Combine rewards with a balance to prioritize hovering
+            rew_stage_2_reward = 0.8 * rew_hover + 0.2 * rew_dual
+            self.rew_buf.fill_(rew_stage_2_reward)
+            self.episode_sums["rew_stage_2"] += rew_stage_2_reward.item()
+
+            # Condition to advance spin_count
+            if distance_to_dual < 0.02:  # Threshold for spin count increment
+                self.spin_count += 1
+
+        elif self.spin_count == 4:
+            # Similar reward mechanism for stage 3, focusing on stable hovering at the ball center
+            distance_to_ball_center = torch.norm(self.root_pos - ball_center)
+            adjusted_distance_to_ball_center = scale * (distance_to_ball_center - shift)
+            rew_stage_3_reward = 1.0 / (1.0 + torch.exp(-adjusted_distance_to_ball_center))
+            self.rew_buf.fill_(rew_stage_3_reward)
+            self.episode_sums["rew_stage_3"] += rew_stage_3_reward.item()
 
 
     def is_done(self) -> None:
