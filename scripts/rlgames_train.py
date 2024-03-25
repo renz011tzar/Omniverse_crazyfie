@@ -73,6 +73,7 @@ class RLGTrainer:
         with open(os.path.join(experiment_dir, "config.yaml"), "w") as f:
             f.write(OmegaConf.to_yaml(self.cfg))
 
+
         runner.run(
             {"train": not self.cfg.test, "play": self.cfg.test, "checkpoint": self.cfg.checkpoint, "sigma": None}
         )

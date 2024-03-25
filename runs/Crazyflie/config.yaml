@@ -13,7 +13,7 @@ multi_gpu: false
 num_threads: 4
 solver_type: 1
 test: true
-checkpoint: /home/renzo/OmniIsaacGymEnvs/omniisaacgymenvs/runs/Crazyflie/nn/Crazyflie_ep_136_rew_21405.58.pth
+checkpoint: /home/renzo/.local/share/ov/pkg/isaac_sim-2023.1.1/OmniIsaacGymEnvs/omniisaacgymenvs/runs/Crazyflie/nn/last_Crazyflie_ep_1000_rew_14730.136.pth
 evaluation: false
 headless: false
 enable_livestream: false
