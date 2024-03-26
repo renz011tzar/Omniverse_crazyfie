@@ -1,32 +1,3 @@
-# Copyright (c) 2018-2022, NVIDIA Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-
 import numpy as np
 import torch
 from omni.isaac.core.objects import DynamicSphere
@@ -36,7 +7,6 @@ from omni.isaac.core.utils.torch.rotations import *
 from omniisaacgymenvs.tasks.base.rl_task import RLTask
 from omniisaacgymenvs.robots.articulations.crazyflie import Crazyflie
 from omniisaacgymenvs.robots.articulations.views.crazyflie_view import CrazyflieView
-import torch.distributions as D
 
 EPS = 1e-6  # small constant to avoid divisions by 0 and log(0)
 
@@ -44,46 +14,20 @@ EPS = 1e-6  # small constant to avoid divisions by 0 and log(0)
 class CrazyflieTask(RLTask):
     def __init__(self, name, sim_config, env, offset=None) -> None:
         self.update_config(sim_config)
-
+        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self._num_observations = 18
         self._num_actions = 4
-
-        self._ball_position = torch.tensor([0, 0, 2.0])
-
+        self.stage = 1
+        self._crazyflie_position = torch.tensor([0, 0, 1.0],device=self._device)
+        self._red_ball_position = torch.tensor([0.0, 0.0, 1.0],device=self._device)
+        self._blue_ball_position = torch.tensor([4.0, 5.0, 2.0],device=self._device)
+        self._yellow_ball_position = torch.tensor([7.0, 8.0, 3.0],device=self._device)
+        self.reach_ball_reward = 1.0
+        self.final_ball_reward = 10.0
+        self.flip_finish_reward = 5.0
+        self.proximity_threshold = 0.5
+        
         RLTask.__init__(self, name=name, env=env)
-
-        self._crazyflie_position = torch.tensor([0, 0, 2.0], device=self.device)
-
-        self.init_rpy_dist = D.Uniform(
-            torch.tensor([-0.2, -0.2, 0.], device=self.device) * torch.pi,
-            torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
-        )
-        lower_bounds = torch.tensor([0., 0., 0.], device=self.device) * torch.pi
-        upper_bounds = torch.tensor([EPS, EPS, 2.], device=self.device) * torch.pi
-
-        # Create the uniform distribution
-        self.traj_rpy_dist = D.Uniform(lower_bounds, upper_bounds)
-
-        self.traj_c_dist = D.Uniform(
-            torch.tensor(-0.6, device=self.device),
-            torch.tensor(0.6, device=self.device)
-        )
-        self.traj_scale_dist = D.Uniform(
-            torch.tensor([1.8, 1.8, 1.], device=self.device),
-            torch.tensor([3.2, 3.2, 1.5], device=self.device)
-        )
-        self.traj_w_dist = D.Uniform(
-            torch.tensor(0.8, device=self.device),
-            torch.tensor(1.1, device=self.device)
-        )
-
-        self.traj_t0 = torch.pi / 2
-        self.traj_c = torch.zeros(self.num_envs, device=self.device)
-        self.traj_scale = torch.zeros(self.num_envs, 3, device=self.device)
-        self.traj_rot = torch.zeros(self.num_envs, 4, device=self.device)
-        self.traj_w = torch.ones(self.num_envs, device=self.device)
-
-        self.target_pos = torch.zeros(self.num_envs, 4, 3, device=self.device)
 
         return
 
@@ -120,30 +64,45 @@ class CrazyflieTask(RLTask):
 
         self.grav_z = -1.0 * self._task_cfg["sim"]["gravity"][2]
 
+    
+    # Remember to call `get_targets` instead of `get_target` in your `set_up_scene` method.
     def set_up_scene(self, scene) -> None:
         self.get_crazyflie()
-        self.get_target()
+        self.get_targets()  # Updated method call
         RLTask.set_up_scene(self, scene)
         self._copters = CrazyflieView(prim_paths_expr="/World/envs/.*/Crazyflie", name="crazyflie_view")
-        self._balls = RigidPrimView(prim_paths_expr="/World/envs/.*/ball", name="ball_view")
+        self._red_ball = RigidPrimView(prim_paths_expr="/World/envs/.*/red_ball", name="red_ball_view")
+        self._blue_ball = RigidPrimView(prim_paths_expr="/World/envs/.*/blue_ball", name="blue_ball_view")
+        self._yellow_ball = RigidPrimView(prim_paths_expr="/World/envs/.*/yellow_ball", name="yellow_ball_view")
         scene.add(self._copters)
-        scene.add(self._balls)
+        scene.add(self._red_ball)
+        scene.add(self._blue_ball)
+        scene.add(self._yellow_ball)
         for i in range(4):
             scene.add(self._copters.physics_rotors[i])
-        return
+
 
     def initialize_views(self, scene):
         super().initialize_views(scene)
         if scene.object_exists("crazyflie_view"):
             scene.remove_object("crazyflie_view", registry_only=True)
-        if scene.object_exists("ball_view"):
-            scene.remove_object("ball_view", registry_only=True)
+        if scene.object_exists("red_ball_view"):
+            scene.remove_object("red_ball_view", registry_only=True)
+        if scene.object_exists("blue_ball_view"):
+            scene.remove_object("blue_ball_view", registry_only=True)
+        if scene.object_exists("yellow_ball_view"):
+            scene.remove_object("yellow_ball_view", registry_only=True)
+
         for i in range(1, 5):
             scene.remove_object(f"m{i}_prop_view", registry_only=True)
         self._copters = CrazyflieView(prim_paths_expr="/World/envs/.*/Crazyflie", name="crazyflie_view")
-        self._balls = RigidPrimView(prim_paths_expr="/World/envs/.*/ball", name="ball_view")
+        self._red_ball = RigidPrimView(prim_paths_expr="/World/envs/.*/red_ball", name="red_ball_view")
+        self._blue_ball = RigidPrimView(prim_paths_expr="/World/envs/.*/blue_ball", name="blue_ball_view")
+        self._yellow_ball = RigidPrimView(prim_paths_expr="/World/envs/.*/yellow_ball", name="yellow_ball_view")
         scene.add(self._copters)
-        scene.add(self._balls)
+        scene.add(self._red_ball)
+        scene.add(self._blue_ball)
+        scene.add(self._yellow_ball)
         for i in range(4):
             scene.add(self._copters.physics_rotors[i])
 
@@ -155,25 +114,57 @@ class CrazyflieTask(RLTask):
             "crazyflie", get_prim_at_path(copter.prim_path), self._sim_config.parse_actor_config("crazyflie")
         )
 
-    def get_target(self):
-        radius = 0.01
-        color = torch.tensor([1, 0, 0])
-        ball = DynamicSphere(
-            prim_path=self.default_zero_env_path + "/ball",
-            translation=self._ball_position,
+
+    def get_targets(self):
+        # Define positions for the red, blue and yellow balls
+        radius = 0.1
+        red_ball = DynamicSphere(
+            prim_path=self.default_zero_env_path + "/red_ball",
+            translation=self._red_ball_position,
             name="target_0",
             radius=radius,
-            color=color,
+            color=torch.tensor([1, 0, 0]),
         )
         self._sim_config.apply_articulation_settings(
-            "ball", get_prim_at_path(ball.prim_path), self._sim_config.parse_actor_config("ball")
+            "red_ball", get_prim_at_path(red_ball.prim_path), self._sim_config.parse_actor_config("ball")
         )
-        ball.set_collision_enabled(False)
+        
+
+        # Create the blue ball
+        blue_ball = DynamicSphere(
+            prim_path=self.default_zero_env_path + "/blue_ball",
+            translation=self._blue_ball_position.cpu().numpy(),  # Assuming simulation uses CPU numpy arrays
+            name="blue_ball",
+            radius=radius,
+            color=torch.tensor([0, 0, 1], device=self._device).cpu().numpy()  # Blue color
+        )
+        self._sim_config.apply_articulation_settings(
+            "blue_ball", get_prim_at_path(blue_ball.prim_path), self._sim_config.parse_actor_config("blue_ball")
+        )
+
+        # Create the yellow ball
+        yellow_ball = DynamicSphere(
+            prim_path=self.default_zero_env_path + "/yellow_ball",
+            translation=self._yellow_ball_position.cpu().numpy(),  # Assuming simulation uses CPU numpy arrays
+            name="yellow_ball",
+            radius=radius,
+            color=torch.tensor([1, 1, 0], device=self._device).cpu().numpy()  # Yellow color
+        )
+        self._sim_config.apply_articulation_settings(
+            "yellow_ball", get_prim_at_path(yellow_ball.prim_path), self._sim_config.parse_actor_config("yellow_ball")
+        )
+
+        # Optionally disable collision if these are purely visual/positional targets
+        red_ball.set_collision_enabled(False)
+        blue_ball.set_collision_enabled(False)
+        yellow_ball.set_collision_enabled(False)
+
 
     def get_observations(self) -> dict:
         self.root_pos, self.root_rot = self._copters.get_world_poses(clone=False)
         self.root_velocities = self._copters.get_velocities(clone=False)
-
+        stage_info = torch.full((self._num_envs, 1), fill_value=self.stage, dtype=torch.float32, device=self._device)
+        self.obs_buf[..., -1:] = stage_info  # Assuming the last slot in obs_buf is reserved for the stage info
         root_positions = self.root_pos - self._env_pos
         root_quats = self.root_rot
 
@@ -199,7 +190,8 @@ class CrazyflieTask(RLTask):
     def pre_physics_step(self, actions) -> None:
         if not self.world.is_playing():
             return
-
+        self.update_stage()
+        print(self.stage)
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
             self.reset_idx(reset_env_ids)
@@ -319,7 +311,7 @@ class CrazyflieTask(RLTask):
         self.dof_pos = self._copters.get_joint_positions()
         self.dof_vel = self._copters.get_joint_velocities()
 
-        self.initial_ball_pos, self.initial_ball_rot = self._balls.get_world_poses(clone=False)
+        self.initial_ball_pos, self.initial_ball_rot = self._red_ball.get_world_poses(clone=False)
         self.initial_root_pos, self.initial_root_rot = self.root_pos.clone(), self.root_rot.clone()
 
         # control parameters
@@ -332,6 +324,7 @@ class CrazyflieTask(RLTask):
     def set_targets(self, env_ids):
         num_sets = len(env_ids)
         envs_long = env_ids.long()
+
         # set target position randomly with x, y in (0, 0) and z in (2)
         self.target_positions[envs_long, 0:2] = torch.zeros((num_sets, 2), device=self._device)
         self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0
@@ -339,38 +332,24 @@ class CrazyflieTask(RLTask):
         # shift the target up so it visually aligns better
         ball_pos = self.target_positions[envs_long] + self._env_pos[envs_long]
         ball_pos[:, 2] += 0.0
-        self._balls.set_world_poses(ball_pos[:, 0:3], self.initial_ball_rot[envs_long].clone(), indices=env_ids)
+        self._red_ball.set_world_poses(ball_pos[:, 0:3], self.initial_ball_rot[envs_long].clone(), indices=env_ids)
+        self._blue_ball.set_world_poses(ball_pos[:, 0:3], self.initial_ball_rot[envs_long].clone(), indices=env_ids)
+        self._yellow_ball.set_world_poses(ball_pos[:, 0:3], self.initial_ball_rot[envs_long].clone(), indices=env_ids)
 
-        self.target_pos = self._compute_traj(4,env_ids, step_size=5)
-        pos_expanded=self.root_pos.unsqueeze(1)
-        self.rpos = self.target_pos - pos_expanded
+        # # Calculate positions for each of the three balls relative to each environment's base position
+        # red_ball_pos = self._red_ball_position.repeat(num_sets, 1).to(self.device) + self._env_pos[envs_long]
+        # blue_ball_pos = self._blue_ball_position.repeat(num_sets, 1).to(self.device) + self._env_pos[envs_long]
+        # yellow_ball_pos = self._yellow_ball_position.repeat(num_sets, 1).to(self.device) + self._env_pos[envs_long]
 
-    def euler_to_quaternion(self, euler: torch.Tensor) -> torch.Tensor:
-        euler = torch.as_tensor(euler)
-        r, p, y = torch.unbind(euler, dim=-1)
-        cy = torch.cos(y * 0.5)
-        sy = torch.sin(y * 0.5)
-        cp = torch.cos(p * 0.5)
-        sp = torch.sin(p * 0.5)
-        cr = torch.cos(r * 0.5)
-        sr = torch.sin(r * 0.5)
+        # # Assuming you have mechanisms to set positions for individual balls
+        # self._red_ball.set_world_poses(positions=red_ball_pos, indices=env_ids)
+        # self._blue_ball.set_world_poses(positions=blue_ball_pos, indices=env_ids)
+        # self._yellow_ball.set_world_poses(positions=yellow_ball_pos, indices=env_ids)
 
-        qw = cr * cp * cy + sr * sp * sy
-        qx = sr * cp * cy - cr * sp * sy
-        qy = cr * sp * cy + sr * cp * sy
-        qz = cr * cp * sy - sr * sp * cy
 
-        quaternion = torch.stack([qw, qx, qy, qz], dim=-1)
 
-        return quaternion
-    
     def reset_idx(self, env_ids):
         num_resets = len(env_ids)
-        self.traj_c[env_ids] = self.traj_c_dist.sample(env_ids.shape)
-        self.traj_rot[env_ids] = self.euler_to_quaternion(self.traj_rpy_dist.sample(env_ids.shape))
-        self.traj_scale[env_ids] = self.traj_scale_dist.sample(env_ids.shape)
-        traj_w = self.traj_w_dist.sample(env_ids.shape)
-        self.traj_w[env_ids] = torch.randn_like(traj_w).sign() * traj_w
 
         self.dof_pos[env_ids, :] = torch_rand_float(-0.0, 0.0, (num_resets, self._copters.num_dof), device=self._device)
         self.dof_vel[env_ids, :] = 0
@@ -402,66 +381,83 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def lemniscate(self, t, c):
-        sin_t = torch.sin(t)
-        cos_t = torch.cos(t)
-        sin2p1 = torch.square(sin_t) + 1
+    def evaluate_double_flip(self, initial_orientation, final_orientation):
+        """
+        Evaluate the drone's performance in executing two consecutive 180-degree flips.
 
-        x = torch.stack([
-            cos_t, sin_t * cos_t, c * sin_t
-        ], dim=-1) / sin2p1.unsqueeze(-1)
+        Args:
+            initial_orientation (torch.Tensor): The drone's initial orientation as a quaternion (wxyz format).
+            final_orientation (torch.Tensor): The drone's final orientation after attempting two flips, as a quaternion (wxyz format).
 
-        return x
-    
-    def scale_time(self, t, a: float=1.0):
-        return t / (1 + 1/(a*torch.abs(t)))
-    
-    def quat_rotate(self, q: torch.Tensor, v: torch.Tensor):
-        shape = q.shape
-        q_w = q[:, 0]
-        q_vec = q[:, 1:]
-        
-        a = v * (2.0 * q_w ** 2 - 1.0).unsqueeze(-1)
-        b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
-        
-        c = q_vec * torch.bmm(q_vec.view(shape[0], 1, 3), v.view(shape[0], 3, 1)).squeeze(-1) * 2.0
-        return a + b + c
-    
-    def _compute_traj(self, steps: int, env_ids=None, step_size: float=1.):
-        if env_ids is None:
-            env_ids = ...
+        Returns:
+            torch.Tensor: A scalar tensor representing the reward based on the accuracy of the flips.
+        """
+        # Convert orientations to xyzw format for compatibility with utility functions
+        initial_orientation_xyzw = wxyz2xyzw(initial_orientation)
+        final_orientation_xyzw = wxyz2xyzw(final_orientation)
 
-        t = self.progress_buf[env_ids].unsqueeze(1) + step_size * torch.arange(steps, device=self.device)
-        t = self.traj_t0 + self.scale_time(self.traj_w[env_ids].unsqueeze(1) * t * self.dt)
-        traj_rot = self.traj_rot[env_ids].unsqueeze(1).expand(-1, t.shape[1], 4)
-        
-        target_pos = torch.vmap(self.lemniscate)(t, self.traj_c[env_ids])
+        # Expected change in orientation after two 180-degree flips should ideally bring the drone back to its initial orientation
+        # However, due to potential inaccuracies, we assess the difference from the initial orientation
+        diff_rad = quat_diff_rad(initial_orientation_xyzw, final_orientation_xyzw)
 
-        # The problematic line
-        target_pos = torch.vmap(self.quat_rotate)(traj_rot, target_pos) * self.traj_scale[env_ids].unsqueeze(1)
+        # Reward based on the difference, with smaller differences resulting in higher rewards
+        # Assuming a tolerance of pi / 10 radians (18 degrees) for the flips to be considered accurate
+        tolerance_rad = np.pi / 10
+        accuracy_measure = torch.exp(-10 * torch.abs(diff_rad))
 
-        crazyflie_pos_expanded = self._crazyflie_position.unsqueeze(0).unsqueeze(0)  # Shape becomes [1, 1, 3]
-        dynamic_target_pos = target_pos + crazyflie_pos_expanded  # Resulting shape will be [4096, 4, 3]
+        # Clamp the reward to a maximum of 1.0
+        flip_reward = torch.clamp(accuracy_measure, max=1.0)
 
-        return dynamic_target_pos
+        return flip_reward
 
-    
+    def flips_executed_successfully(self):
+        """
+        Determine if two consecutive 180-degree flips were executed successfully.
+        This function checks if the drone's orientation after the flips closely matches
+        its initial orientation, accounting for a reasonable tolerance.
+        """
+        # Calculate the difference in orientation in radians
+        diff_rad = quat_diff_rad(self.initial_orientation, self.root_rot)
+
+        # Define a tolerance level for the flip accuracy
+        # Considering a tolerance that accounts for slight inaccuracies in flip execution
+        tolerance_rad = torch.tensor(np.pi / 18, device=self.device)  # Tolerance of 10 degrees in radians
+
+        # Check if the orientation difference is within the tolerance
+        successful_flips = diff_rad <= tolerance_rad
+
+        # Return True if flips are successful
+        return successful_flips.all()
+
+
+
+    def update_stage(self):
+
+        self.drone_position = self.root_pos
+        # Transition from stage 0 to 1: Reaching the blue ball
+        if self.stage == 1 and torch.norm(self.drone_position - self._blue_ball_position, dim=1).min() < 0.5:
+            self.stage = 2
+            self.initial_orientation = self.root_rot.clone()
+        elif self.stage == 2 and self.flips_executed_successfully():
+            self.stage = 3  # Drone is executing flips.
+            # Capture initial orientation at the start of flips
+            
+        elif self.stage == 3 and torch.norm(self.drone_position - self._yellow_ball_position, dim=1).min() < 0.5:
+            self.stage = 4
+
     def calculate_metrics(self) -> None:
+        # Calculate rewards for the drone's position, orientation, effort, and spin
         root_positions = self.root_pos - self._env_pos
-        root_quats = self.root_rot
+        root_quats = self.root_rot  
         root_angvels = self.root_velocities[:, 3:]
-
-        reward_distance_scale=2
-
-        target_dist = torch.norm(self.rpos[:, [0]], dim=-1)
-
-        pos_reward=1000000*torch.exp(-reward_distance_scale * target_dist).squeeze(-1)
-
-        target_dist = target_dist.squeeze(-1)
+        # Common reward components:
+        # Position away from the red ball
+        # orient reward
+        # pos reward
+        target_dist = torch.sqrt(torch.square(self.target_positions - root_positions).sum(-1))
+        pos_reward = 1.0 / (1.0 + target_dist)
         self.target_dist = target_dist
         self.root_positions = root_positions
-
-        # orient reward
         ups = quat_axis(root_quats, 2)
         self.orient_z = ups[..., 2]
         up_reward = torch.clamp(ups[..., 2], min=0.0, max=1.0)
@@ -473,10 +469,33 @@ class CrazyflieTask(RLTask):
         # spin reward
         spin = torch.square(root_angvels).sum(-1)
         spin_reward = 0.01 * torch.exp(-1.0 * spin)
+        # Calculate the traget distance for blue and yellow ball
 
-        # combined reward
-        self.rew_buf[:] = pos_reward + pos_reward * (up_reward + spin_reward) - effort_reward
+        if self.stage == 1:
+            blue_ball_distance = torch.norm(self.root_pos - self._blue_ball_position, dim=1)
+            # Reward for moving towards the blue ball
+            blue_ball_reward = torch.exp(-0.1 * blue_ball_distance)
+            # Reward for reaching the blue ball
+            if torch.any(blue_ball_distance < self.proximity_threshold):
+                self.rew_buf[:] += self.reach_ball_reward  # Define reach_ball_reward as a class attribute
+            self.rew_buf[:] += pos_reward + blue_ball_reward +  blue_ball_reward*(up_reward + spin_reward) - effort_reward
 
+        elif self.stage == 2:
+            # Reward for successful flips
+            score = self.evaluate_double_flip(self.initial_orientation, self.root_rot)
+            # Assuming you have a method to check flip success
+            if self.flips_executed_successfully():  
+                self.rew_buf[:] += self.flip_finish_reward  # Define flip_reward as a class attribute
+            self.rew_buf[:] += score + score*(up_reward + spin_reward) - effort_reward
+        
+        elif self.stage == 3:
+            yellow_ball_distance = torch.norm(self.root_pos - self._yellow_ball_position, dim=1)
+            yellow_ball_reward = torch.exp(-0.1 * yellow_ball_distance)
+            # Reward for reaching the yellow ball
+            if torch.any(yellow_ball_distance < self.proximity_threshold):
+                self.rew_buf[:] += self.final_ball_reward  # Define final_ball_reward as a class attribute
+            self.rew_buf[:] += pos_reward + yellow_ball_reward + yellow_ball_reward*(up_reward + spin_reward) - effort_reward 
+        
         # log episode reward sums
         self.episode_sums["rew_pos"] += pos_reward
         self.episode_sums["rew_orient"] += up_reward
@@ -484,21 +503,39 @@ class CrazyflieTask(RLTask):
         self.episode_sums["rew_spin"] += spin_reward
 
         # log raw info
-        self.episode_sums["raw_dist"] += target_dist
-        self.episode_sums["raw_orient"] += ups[..., 2]
+        self.episode_sums["raw_dist"] += torch.norm(self.root_pos - self._red_ball_position, dim=1)
+        self.episode_sums["raw_orient"] += self.orient_z[..., 2]
         self.episode_sums["raw_effort"] += effort
         self.episode_sums["raw_spin"] += spin
 
+
     def is_done(self) -> None:
-        # resets due to misbehavior
-        ones = torch.ones_like(self.reset_buf)
-        die = torch.zeros_like(self.reset_buf)
-        die = torch.where(self.target_dist > 1, ones, die)
+        # Assuming the environment has attributes for tracking distances to the blue and yellow balls,
+        # the drone's altitude, and the current rotation stage.
+        ones = torch.ones_like(self.reset_buf, device=self.device)
+        die = torch.zeros_like(self.reset_buf, device=self.device)
 
-        # z >= 0.5 & z <= 5.0 & up > 0
-        die = torch.where(self.root_positions[..., 2] < 0.5, ones, die)
-        die = torch.where(self.root_positions[..., 2] > 5.0, ones, die)
-        die = torch.where(self.orient_z < 0.0, ones, die)
+        # Distance to blue and yellow balls
+        distance_to_blue = torch.norm(self.root_pos - self._blue_ball_position, dim=1)
+        distance_to_yellow = torch.norm(self.root_pos - self._yellow_ball_position, dim=1)
 
-        # resets due to episode length
+        # Task-specific conditions
+        # Resets if the drone strays too far from either objective
+        die = torch.where(distance_to_blue > 10.0, ones, die)
+        die = torch.where(distance_to_yellow > 10.0, ones, die)
+
+        # Resets if altitude or orientation criteria are violated
+        die = torch.where(self.root_pos[..., 2] < 0.5, ones, die)  # Too low
+        die = torch.where(self.root_pos[..., 2] > 5.0, ones, die)  # Too high
+        die = torch.where(self.orient_z < 0.0, ones, die)  # Upside down
+
+        # Checks if the task is completed: close to yellow ball and completed rotations
+        if self.stage == 3 and torch.norm(self.root_pos - self._yellow_ball_position, dim=1).min() < self.proximity_threshold:
+            close_to_yellow_and_done = (distance_to_yellow < 0.5) & (self.stage == 2)
+            completed_task = torch.where(close_to_yellow_and_done, torch.zeros_like(self.reset_buf, device=self.device), torch.ones_like(self.reset_buf, device=self.device))
+            self.reset_buf[:] = torch.where(completed_task == 0, torch.zeros_like(self.reset_buf, device=self.device), self.reset_buf)
+
+            # Optionally, set a flag to indicate task completion for logging or debugging
+            self.task_completed = completed_task == 0
+        # Resets due to episode length or completing the task
         self.reset_buf[:] = torch.where(self.progress_buf >= self._max_episode_length - 1, ones, die)
