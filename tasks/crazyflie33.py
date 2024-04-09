@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import math
+
 import numpy as np
 import torch
 from omni.isaac.core.objects import DynamicSphere
@@ -43,15 +43,16 @@ EPS = 1e-6  # small constant to avoid divisions by 0 and log(0)
 class CrazyflieTask(RLTask):
     def __init__(self, name, sim_config, env, offset=None) -> None:
         self.update_config(sim_config)
-
+        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self._num_observations = 18
         self._num_actions = 4
 
-        self._crazyflie_position = torch.tensor([0, 0, 2.0])
+        self._crazyflie_position = torch.tensor([0, 0, 1.0])
         self._ball_position = torch.tensor([0, 0, 1.0])
+        self.phase = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
+        self.spin_count = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
 
         RLTask.__init__(self, name=name, env=env)
-        self.spin_start_step = torch.zeros(self._num_envs, device=self.device)
 
         return
 
@@ -272,17 +273,9 @@ class CrazyflieTask(RLTask):
 
         torch_zeros = lambda: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.episode_sums = {
-            "rew_pos": torch_zeros(),
-            "rew_orient": torch_zeros(),
-            "rew_effort": torch_zeros(),
-            "rew_spin": torch_zeros(),
-            "rew_speed": torch_zeros(),
-            "rew_coline": torch_zeros(),
-            "rew_angvel": torch_zeros(),
-            "raw_dist": torch_zeros(),
-            "raw_orient": torch_zeros(),
-            "raw_effort": torch_zeros(),
-            "raw_spin": torch_zeros(),
+            "rew_stage_1": torch.zeros(self._num_envs, device=self._device),
+            "rew_stage_2": torch.zeros(self._num_envs, device=self._device),
+            "rew_stage_3": torch.zeros(self._num_envs, device=self._device),
         }
 
         self.root_pos, self.root_rot = self._copters.get_world_poses()
@@ -305,7 +298,7 @@ class CrazyflieTask(RLTask):
         envs_long = env_ids.long()
         # set target position randomly with x, y in (0, 0) and z in (2)
         self.target_positions[envs_long, 0:2] = torch.zeros((num_sets, 2), device=self._device)
-        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0+0.3
+        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0
 
         # shift the target up so it visually aligns better
         ball_pos = self.target_positions[envs_long] + self._env_pos[envs_long]
@@ -314,6 +307,8 @@ class CrazyflieTask(RLTask):
 
     def reset_idx(self, env_ids):
         num_resets = len(env_ids)
+        self.phase.fill_(0)
+        self.spin_count.fill_(0)
 
         self.dof_pos[env_ids, :] = torch_rand_float(-0.0, 0.0, (num_resets, self._copters.num_dof), device=self._device)
         self.dof_vel[env_ids, :] = 0
@@ -338,7 +333,6 @@ class CrazyflieTask(RLTask):
 
         self.thrust_cmds_damp[env_ids] = 0
         self.thrust_rot_damp[env_ids] = 0
-        self.spin_start_step=0
 
         # fill extras
         self.extras["episode"] = {}
@@ -346,139 +340,85 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def target_position_spin(self, root_positions, steps):
-        radius = 0.3
-        theta = torch.tensor(-2 * math.pi / 350 * steps)
-        center_z = 2.0
+    def calculate_dual_position(self, idx, center):
+        # Calculate the vector from the center to the drone's current position
+        vector_center_to_drone = self.root_pos[idx] - center
 
-        spin_condition = (self.progress_buf - self.spin_start_step <= 900)
-        spin_condition = spin_condition.unsqueeze(-1)
+        # Calculate the true distance from the drone's current position to the center
+        true_distance = torch.norm(vector_center_to_drone)
 
-        x = root_positions[:, 0]
-        z = root_positions[:, 2]-center_z
-            
-        # Calculate the scale factor to ensure the point lies on the circle with radius 0.5
-        scale = radius / torch.sqrt(x**2 + z**2)
-            
-        # Calculate x1 and z1 to make points lie on the circle
-        x1 = x * scale
-        z1 = z * scale
-            
-        # Construct the new points [x1, 0, z1] for each root_position
-        new_points = torch.stack([x1, torch.zeros_like(x1), z1], dim=1)
-            
-        # Calculate the cosine and sine of the rotation angle
-        cos_theta = torch.cos(theta)
-        sin_theta = torch.sin(theta)
-            
-        # Apply the rotation matrix for clockwise rotation in the XZ plane
-        x_rotated = new_points[:, 0] * cos_theta + new_points[:, 2] * sin_theta
-        z_rotated = -new_points[:, 0] * sin_theta + new_points[:, 2] * cos_theta
-            
-        # Construct the rotated points [x_rotated, 0, z_rotated]
-        rotated_points = torch.stack([x_rotated, new_points[:, 1], z_rotated], dim=1)   
+        # Calculate the distance from the center to the dual position
+        distance_center_to_dual = 4.0 / true_distance
 
-        new_points_bef=self.root_pos - self._env_pos
-        rotated_points_bef=self.target_positions
+        # Normalize the vector from the center to the drone to get the direction
+        direction = vector_center_to_drone / true_distance
 
-        new_points_final=torch.where(spin_condition, new_points, new_points_bef)
-        rotated_points_final=torch.where(spin_condition, rotated_points,rotated_points_bef)
-        
-        return new_points_final, rotated_points_final
-    
+        # Calculate the dual position by extending the vector from the center in the direction of the drone
+        dual_position = center + direction * distance_center_to_dual
+
+        return dual_position
+
     def calculate_metrics(self) -> None:
+        # Reset reward buffer and other accumulators at the start of each metric calculation
         root_positions = self.root_pos - self._env_pos
-        #root_positions[:, 0] -= 1
         root_quats = self.root_rot
-        root_vel = self.root_velocities[:, :3]
         root_angvels = self.root_velocities[:, 3:]
+        self.rew_buf[:] = 0
+        rew_stage_1_reward = torch.zeros(self._num_envs, device=self._device)
+        rew_stage_2_reward = torch.zeros(self._num_envs, device=self._device)
+        rew_stage_3_reward = torch.zeros(self._num_envs, device=self._device)
+
+        target_dist = torch.sqrt(torch.square(self.target_positions - root_positions).sum(-1))
+        self.target_dist = target_dist
         self.root_positions = root_positions
-        #self.root_positions[:, 0] += 1
 
-        scaled_points, global_target_positions = self.target_position_spin(root_positions,0)
-        rotated_points_list = []
-        for i in range(4):
-            _, rotated_points = self.target_position_spin(root_positions, i)
-            rotated_points_list.append(rotated_points)
+        for i in range(self._num_envs):
+            # Common calculations for all stages
+            center = torch.tensor([0, 0, 1], device=self._device) if self.spin_count[i] % 2 == 0 else torch.tensor([0, 0, -1], device=self._device)
+            distance_to_center = torch.norm(self.root_pos[i] - center)
 
-        # Average the rotated points across the 4 steps
-        next_step = sum(rotated_points_list) / 4
-        radius=0.3
-        desired_speed_spin = 2*radius*math.pi / 3.5  # Setting desired speed as pi/3
-        current_speeds = torch.norm(root_vel, dim=1)  # Calculate the magnitudes of current velocities
+            # Stage 1: Reach above the ball at [0, 0, 1]
+            if self.phase[i] == 0:
+                rew_stage_1_reward[i] = 1.0 / (1.0 + distance_to_center)
+                if distance_to_center < 0.1:
+                    self.phase[i] = 1  # Transition to Stage 2
 
-        target_dist_approach = torch.norm(root_positions - self.target_positions, dim=1)
-        global_target_dist = torch.norm(root_positions - global_target_positions, dim=1)
+            # Stage 2: Spin and hover, alternating centers
+            elif self.phase[i] == 1 and self.spin_count[i] < 4:
+                rew_stage_2_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Heavier reward for hovering
+                dual_position = self.calculate_dual_position(i, center)
+                dual_center = -center  # Assuming dual_center logic as per your instructions
+                distance_to_dual = torch.norm(self.root_pos[i] - (dual_center + dual_position))
+                rew_stage_2_reward[i] = rew_stage_2_reward[i]+1.0 / (1.0 + distance_to_dual)
+                if distance_to_dual < 0.1:
+                    self.spin_count[i] += 1
 
-        min_dist = torch.min(target_dist_approach, global_target_dist)
-        spin_start_condition = (min_dist> 0.2)
-        
-        self.target_dist=torch.where(spin_start_condition, 5*target_dist_approach,global_target_dist)
-        desired_speed_val=torch.ones_like(current_speeds)*desired_speed_spin
-        self.spin_start_step=torch.where(spin_start_condition, self.spin_start_step+1, self.spin_start_step)
+            # Stage 3: Hover at [0, 0, 1] after completing spins
+            elif self.phase[i] == 1 and self.spin_count[i] == 4:
+                rew_stage_3_reward[i] = 1.0 / (1.0 + distance_to_center) * 10  # Continue heavy reward for hovering
 
-        spin_start_condition_alt=spin_start_condition.unsqueeze(-1)
-        next_step=torch.where(spin_start_condition_alt, self.target_positions, next_step)
-            
-        pos_reward = torch.exp(-3*self.target_dist)
+        # Accumulate rewards in the buffer
+        self.rew_buf[:] = rew_stage_1_reward + rew_stage_2_reward + rew_stage_3_reward
 
-        # orient reward
-        ups = quat_axis(root_quats, 2)
-        self.orient_z = ups[..., 2]
-        up_reward = torch.clamp(ups[..., 2], min=0.0, max=1.0)
+        # Update episode sums for logging
+        self.episode_sums["rew_stage_1"] += rew_stage_1_reward.sum()
+        self.episode_sums["rew_stage_2"] += rew_stage_2_reward.sum()
+        self.episode_sums["rew_stage_3"] += rew_stage_3_reward.sum()
 
-        spin_factor= 1/ (2*math.pi/3.5)**2
-        spin = torch.square(root_angvels).sum(-1)
-        spin_reward = torch.exp(-spin_factor * spin)
-
-        # effort reward
-        effort = torch.square(self.actions).sum(-1)
-        effort_reward = 0.05 * torch.exp(-0.5 * effort)
-
-        spin_completion_condition = (self.progress_buf - self.spin_start_step >= 700)
-        desired_speed=torch.where(spin_completion_condition,torch.zeros_like(current_speeds),desired_speed_val)
-
-        speed_diff = torch.abs(current_speeds - desired_speed)  # Calculate the absolute difference from the desired speed
-        traj = next_step - scaled_points
-
-        # Normalize root_vel and traj to unit vectors
-        norm_root_vel = root_vel / torch.norm(root_vel, dim=1, keepdim=True)
-        norm_traj = traj / torch.norm(traj, dim=1, keepdim=True)
-        # Calculate the dot product
-        dot_product = torch.sum(norm_root_vel * norm_traj, dim=1)
-        colinearity = 1 - dot_product
-
-        # Define the exponential reward
-        speed_reward = torch.exp(-3 * speed_diff)
-        coline_reward = torch.exp(-3 * colinearity)
-
-        # combined reward
-        self.rew_buf[:] = pos_reward + pos_reward * (up_reward + spin_reward) - effort_reward+speed_reward+coline_reward
-        
-        # log episode reward sums
-        self.episode_sums["rew_pos"] += pos_reward
-        self.episode_sums["rew_orient"] += up_reward
-        self.episode_sums["rew_effort"] += effort_reward
-        self.episode_sums["rew_spin"] += spin_reward
-        self.episode_sums["rew_speed"] += speed_reward
-        self.episode_sums["rew_coline"] += coline_reward
-
-        # log raw info
-        self.episode_sums["raw_dist"] += self.target_dist
-        self.episode_sums["raw_orient"] += ups[..., 2]
-        self.episode_sums["raw_effort"] += effort
-        self.episode_sums["raw_spin"] += spin
 
     def is_done(self) -> None:
-        # resets due to misbehavior
+        # Resets due to misbehavior
         ones = torch.ones_like(self.reset_buf)
         die = torch.zeros_like(self.reset_buf)
+
+        # Example condition: Drone strays too far from the target
         die = torch.where(self.target_dist > 5.0, ones, die)
 
-        # z >= 0.5 & z <= 5.0 & up > 0
+        # Example condition: Drone's altitude drops below a threshold (e.g., crash or too low)
         die = torch.where(self.root_positions[..., 2] < 0.5, ones, die)
-        die = torch.where(self.root_positions[..., 2] > 5.0, ones, die)
-        die = torch.where(self.orient_z < 0.0, ones, die)
 
-        # resets due to episode length
+        # Example condition: Drone's altitude exceeds a threshold (e.g., too high)
+        die = torch.where(self.root_positions[..., 2] > 5.0, ones, die)
+
+        # Resets due to episode length
         self.reset_buf[:] = torch.where(self.progress_buf >= self._max_episode_length - 1, ones, die)

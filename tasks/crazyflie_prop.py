@@ -51,7 +51,6 @@ class CrazyflieTask(RLTask):
         self._ball_position = torch.tensor([0, 0, 1.0])
 
         RLTask.__init__(self, name=name, env=env)
-        self.spin_start_step = torch.zeros(self._num_envs, device=self.device)
 
         return
 
@@ -305,7 +304,7 @@ class CrazyflieTask(RLTask):
         envs_long = env_ids.long()
         # set target position randomly with x, y in (0, 0) and z in (2)
         self.target_positions[envs_long, 0:2] = torch.zeros((num_sets, 2), device=self._device)
-        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0+0.3
+        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0
 
         # shift the target up so it visually aligns better
         ball_pos = self.target_positions[envs_long] + self._env_pos[envs_long]
@@ -338,7 +337,6 @@ class CrazyflieTask(RLTask):
 
         self.thrust_cmds_damp[env_ids] = 0
         self.thrust_rot_damp[env_ids] = 0
-        self.spin_start_step=0
 
         # fill extras
         self.extras["episode"] = {}
@@ -346,45 +344,36 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def target_position_spin(self, root_positions, steps):
-        radius = 0.3
+    def target_position(self, root_positions, steps):
+        radius = 0.5
         theta = torch.tensor(-2 * math.pi / 350 * steps)
-        center_z = 2.0
-
-        spin_condition = (self.progress_buf - self.spin_start_step <= 900)
-        spin_condition = spin_condition.unsqueeze(-1)
+        center_z = 1.0
 
         x = root_positions[:, 0]
         z = root_positions[:, 2]-center_z
-            
+        
         # Calculate the scale factor to ensure the point lies on the circle with radius 0.5
         scale = radius / torch.sqrt(x**2 + z**2)
-            
+        
         # Calculate x1 and z1 to make points lie on the circle
         x1 = x * scale
         z1 = z * scale
-            
+        
         # Construct the new points [x1, 0, z1] for each root_position
         new_points = torch.stack([x1, torch.zeros_like(x1), z1], dim=1)
-            
+        
         # Calculate the cosine and sine of the rotation angle
         cos_theta = torch.cos(theta)
         sin_theta = torch.sin(theta)
-            
+        
         # Apply the rotation matrix for clockwise rotation in the XZ plane
         x_rotated = new_points[:, 0] * cos_theta + new_points[:, 2] * sin_theta
         z_rotated = -new_points[:, 0] * sin_theta + new_points[:, 2] * cos_theta
-            
-        # Construct the rotated points [x_rotated, 0, z_rotated]
-        rotated_points = torch.stack([x_rotated, new_points[:, 1], z_rotated], dim=1)   
-
-        new_points_bef=self.root_pos - self._env_pos
-        rotated_points_bef=self.target_positions
-
-        new_points_final=torch.where(spin_condition, new_points, new_points_bef)
-        rotated_points_final=torch.where(spin_condition, rotated_points,rotated_points_bef)
         
-        return new_points_final, rotated_points_final
+        # Construct the rotated points [x_rotated, 0, z_rotated]
+        rotated_points = torch.stack([x_rotated, new_points[:, 1], z_rotated], dim=1)
+        
+        return new_points, rotated_points
     
     def calculate_metrics(self) -> None:
         root_positions = self.root_pos - self._env_pos
@@ -395,31 +384,18 @@ class CrazyflieTask(RLTask):
         self.root_positions = root_positions
         #self.root_positions[:, 0] += 1
 
-        scaled_points, global_target_positions = self.target_position_spin(root_positions,0)
+        scaled_points, global_target_positions = self.target_position(root_positions,0)
         rotated_points_list = []
         for i in range(4):
-            _, rotated_points = self.target_position_spin(root_positions, i)
+            _, rotated_points = self.target_position(root_positions, i)
             rotated_points_list.append(rotated_points)
 
         # Average the rotated points across the 4 steps
         next_step = sum(rotated_points_list) / 4
-        radius=0.3
-        desired_speed_spin = 2*radius*math.pi / 3.5  # Setting desired speed as pi/3
-        current_speeds = torch.norm(root_vel, dim=1)  # Calculate the magnitudes of current velocities
 
-        target_dist_approach = torch.norm(root_positions - self.target_positions, dim=1)
-        global_target_dist = torch.norm(root_positions - global_target_positions, dim=1)
+        target_dist = torch.norm(root_positions - global_target_positions, dim=1)
+        self.target_dist=target_dist
 
-        min_dist = torch.min(target_dist_approach, global_target_dist)
-        spin_start_condition = (min_dist> 0.2)
-        
-        self.target_dist=torch.where(spin_start_condition, 5*target_dist_approach,global_target_dist)
-        desired_speed_val=torch.ones_like(current_speeds)*desired_speed_spin
-        self.spin_start_step=torch.where(spin_start_condition, self.spin_start_step+1, self.spin_start_step)
-
-        spin_start_condition_alt=spin_start_condition.unsqueeze(-1)
-        next_step=torch.where(spin_start_condition_alt, self.target_positions, next_step)
-            
         pos_reward = torch.exp(-3*self.target_dist)
 
         # orient reward
@@ -427,18 +403,19 @@ class CrazyflieTask(RLTask):
         self.orient_z = ups[..., 2]
         up_reward = torch.clamp(ups[..., 2], min=0.0, max=1.0)
 
-        spin_factor= 1/ (2*math.pi/3.5)**2
-        spin = torch.square(root_angvels).sum(-1)
-        spin_reward = torch.exp(-spin_factor * spin)
-
         # effort reward
         effort = torch.square(self.actions).sum(-1)
         effort_reward = 0.05 * torch.exp(-0.5 * effort)
 
-        spin_completion_condition = (self.progress_buf - self.spin_start_step >= 700)
-        desired_speed=torch.where(spin_completion_condition,torch.zeros_like(current_speeds),desired_speed_val)
+        spin_factor= 1/ (2*math.pi/3.5)**2
+        spin = torch.square(root_angvels).sum(-1)
+        spin_reward = 0.01*torch.exp(-spin_factor * spin)
 
+        desired_speed = math.pi / 3.5  # Setting desired speed as pi/3
+        current_speeds = torch.norm(root_vel, dim=1)  # Calculate the magnitudes of current velocities
         speed_diff = torch.abs(current_speeds - desired_speed)  # Calculate the absolute difference from the desired speed
+        speed_reward = torch.exp(-3 * speed_diff)
+
         traj = next_step - scaled_points
 
         # Normalize root_vel and traj to unit vectors
@@ -449,7 +426,6 @@ class CrazyflieTask(RLTask):
         colinearity = 1 - dot_product
 
         # Define the exponential reward
-        speed_reward = torch.exp(-3 * speed_diff)
         coline_reward = torch.exp(-3 * colinearity)
 
         # combined reward
@@ -464,10 +440,13 @@ class CrazyflieTask(RLTask):
         self.episode_sums["rew_coline"] += coline_reward
 
         # log raw info
-        self.episode_sums["raw_dist"] += self.target_dist
+        self.episode_sums["raw_dist"] += target_dist
         self.episode_sums["raw_orient"] += ups[..., 2]
         self.episode_sums["raw_effort"] += effort
         self.episode_sums["raw_spin"] += spin
+
+        print('current pos: ', root_positions)
+        
 
     def is_done(self) -> None:
         # resets due to misbehavior

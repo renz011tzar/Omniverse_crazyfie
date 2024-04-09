@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import math
+
 import numpy as np
 import torch
 from omni.isaac.core.objects import DynamicSphere
@@ -36,6 +36,7 @@ from omni.isaac.core.utils.torch.rotations import *
 from omniisaacgymenvs.tasks.base.rl_task import RLTask
 from omniisaacgymenvs.robots.articulations.crazyflie import Crazyflie
 from omniisaacgymenvs.robots.articulations.views.crazyflie_view import CrazyflieView
+import torch.distributions as D
 
 EPS = 1e-6  # small constant to avoid divisions by 0 and log(0)
 
@@ -47,11 +48,42 @@ class CrazyflieTask(RLTask):
         self._num_observations = 18
         self._num_actions = 4
 
-        self._crazyflie_position = torch.tensor([0, 0, 2.0])
-        self._ball_position = torch.tensor([0, 0, 1.0])
+        self._ball_position = torch.tensor([0, 0, 2.0])
 
         RLTask.__init__(self, name=name, env=env)
-        self.spin_start_step = torch.zeros(self._num_envs, device=self.device)
+
+        self._crazyflie_position = torch.tensor([0, 0, 2.0], device=self.device)
+
+        self.init_rpy_dist = D.Uniform(
+            torch.tensor([-0.2, -0.2, 0.], device=self.device) * torch.pi,
+            torch.tensor([0.2, 0.2, 2.], device=self.device) * torch.pi
+        )
+        lower_bounds = torch.tensor([0., 0., 0.], device=self.device) * torch.pi
+        upper_bounds = torch.tensor([EPS, EPS, 2.], device=self.device) * torch.pi
+
+        # Create the uniform distribution
+        self.traj_rpy_dist = D.Uniform(lower_bounds, upper_bounds)
+
+        self.traj_c_dist = D.Uniform(
+            torch.tensor(-0.6, device=self.device),
+            torch.tensor(0.6, device=self.device)
+        )
+        self.traj_scale_dist = D.Uniform(
+            torch.tensor([1.8, 1.8, 1.], device=self.device),
+            torch.tensor([3.2, 3.2, 1.5], device=self.device)
+        )
+        self.traj_w_dist = D.Uniform(
+            torch.tensor(0.8, device=self.device),
+            torch.tensor(1.1, device=self.device)
+        )
+
+        self.traj_t0 = torch.pi / 2
+        self.traj_c = torch.zeros(self.num_envs, device=self.device)
+        self.traj_scale = torch.zeros(self.num_envs, 3, device=self.device)
+        self.traj_rot = torch.zeros(self.num_envs, 4, device=self.device)
+        self.traj_w = torch.ones(self.num_envs, device=self.device)
+
+        self.target_pos = torch.zeros(self.num_envs, 4, 3, device=self.device)
 
         return
 
@@ -124,7 +156,7 @@ class CrazyflieTask(RLTask):
         )
 
     def get_target(self):
-        radius = 0.2
+        radius = 0.01
         color = torch.tensor([1, 0, 0])
         ball = DynamicSphere(
             prim_path=self.default_zero_env_path + "/ball",
@@ -276,9 +308,6 @@ class CrazyflieTask(RLTask):
             "rew_orient": torch_zeros(),
             "rew_effort": torch_zeros(),
             "rew_spin": torch_zeros(),
-            "rew_speed": torch_zeros(),
-            "rew_coline": torch_zeros(),
-            "rew_angvel": torch_zeros(),
             "raw_dist": torch_zeros(),
             "raw_orient": torch_zeros(),
             "raw_effort": torch_zeros(),
@@ -305,15 +334,43 @@ class CrazyflieTask(RLTask):
         envs_long = env_ids.long()
         # set target position randomly with x, y in (0, 0) and z in (2)
         self.target_positions[envs_long, 0:2] = torch.zeros((num_sets, 2), device=self._device)
-        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0+0.3
+        self.target_positions[envs_long, 2] = torch.ones(num_sets, device=self._device) * 2.0
 
         # shift the target up so it visually aligns better
         ball_pos = self.target_positions[envs_long] + self._env_pos[envs_long]
         ball_pos[:, 2] += 0.0
         self._balls.set_world_poses(ball_pos[:, 0:3], self.initial_ball_rot[envs_long].clone(), indices=env_ids)
 
+        self.target_pos = self._compute_traj(4,env_ids, step_size=5)
+        pos_expanded=self.root_pos.unsqueeze(1)
+        self.rpos = self.target_pos - pos_expanded
+
+    def euler_to_quaternion(self, euler: torch.Tensor) -> torch.Tensor:
+        euler = torch.as_tensor(euler)
+        r, p, y = torch.unbind(euler, dim=-1)
+        cy = torch.cos(y * 0.5)
+        sy = torch.sin(y * 0.5)
+        cp = torch.cos(p * 0.5)
+        sp = torch.sin(p * 0.5)
+        cr = torch.cos(r * 0.5)
+        sr = torch.sin(r * 0.5)
+
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+
+        quaternion = torch.stack([qw, qx, qy, qz], dim=-1)
+
+        return quaternion
+    
     def reset_idx(self, env_ids):
         num_resets = len(env_ids)
+        self.traj_c[env_ids] = self.traj_c_dist.sample(env_ids.shape)
+        self.traj_rot[env_ids] = self.euler_to_quaternion(self.traj_rpy_dist.sample(env_ids.shape))
+        self.traj_scale[env_ids] = self.traj_scale_dist.sample(env_ids.shape)
+        traj_w = self.traj_w_dist.sample(env_ids.shape)
+        self.traj_w[env_ids] = torch.randn_like(traj_w).sign() * traj_w
 
         self.dof_pos[env_ids, :] = torch_rand_float(-0.0, 0.0, (num_resets, self._copters.num_dof), device=self._device)
         self.dof_vel[env_ids, :] = 0
@@ -338,7 +395,6 @@ class CrazyflieTask(RLTask):
 
         self.thrust_cmds_damp[env_ids] = 0
         self.thrust_rot_damp[env_ids] = 0
-        self.spin_start_step=0
 
         # fill extras
         self.extras["episode"] = {}
@@ -346,125 +402,89 @@ class CrazyflieTask(RLTask):
             self.extras["episode"][key] = torch.mean(self.episode_sums[key][env_ids]) / self._max_episode_length
             self.episode_sums[key][env_ids] = 0.0
 
-    def target_position_spin(self, root_positions, steps):
-        radius = 0.3
-        theta = torch.tensor(-2 * math.pi / 350 * steps)
-        center_z = 2.0
+    def lemniscate(self, t, c):
+        sin_t = torch.sin(t)
+        cos_t = torch.cos(t)
+        sin2p1 = torch.square(sin_t) + 1
 
-        spin_condition = (self.progress_buf - self.spin_start_step <= 900)
-        spin_condition = spin_condition.unsqueeze(-1)
+        x = torch.stack([
+            cos_t, sin_t * cos_t, c * sin_t
+        ], dim=-1) / sin2p1.unsqueeze(-1)
 
-        x = root_positions[:, 0]
-        z = root_positions[:, 2]-center_z
-            
-        # Calculate the scale factor to ensure the point lies on the circle with radius 0.5
-        scale = radius / torch.sqrt(x**2 + z**2)
-            
-        # Calculate x1 and z1 to make points lie on the circle
-        x1 = x * scale
-        z1 = z * scale
-            
-        # Construct the new points [x1, 0, z1] for each root_position
-        new_points = torch.stack([x1, torch.zeros_like(x1), z1], dim=1)
-            
-        # Calculate the cosine and sine of the rotation angle
-        cos_theta = torch.cos(theta)
-        sin_theta = torch.sin(theta)
-            
-        # Apply the rotation matrix for clockwise rotation in the XZ plane
-        x_rotated = new_points[:, 0] * cos_theta + new_points[:, 2] * sin_theta
-        z_rotated = -new_points[:, 0] * sin_theta + new_points[:, 2] * cos_theta
-            
-        # Construct the rotated points [x_rotated, 0, z_rotated]
-        rotated_points = torch.stack([x_rotated, new_points[:, 1], z_rotated], dim=1)   
-
-        new_points_bef=self.root_pos - self._env_pos
-        rotated_points_bef=self.target_positions
-
-        new_points_final=torch.where(spin_condition, new_points, new_points_bef)
-        rotated_points_final=torch.where(spin_condition, rotated_points,rotated_points_bef)
+        return x
+    
+    def scale_time(self, t, a: float=1.0):
+        return t / (1 + 1/(a*torch.abs(t)))
+    
+    def quat_rotate(self, q: torch.Tensor, v: torch.Tensor):
+        shape = q.shape
+        q_w = q[:, 0]
+        q_vec = q[:, 1:]
         
-        return new_points_final, rotated_points_final
+        a = v * (2.0 * q_w ** 2 - 1.0).unsqueeze(-1)
+        b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
+        
+        c = q_vec * torch.bmm(q_vec.view(shape[0], 1, 3), v.view(shape[0], 3, 1)).squeeze(-1) * 2.0
+        return a + b + c
+    
+    def _compute_traj(self, steps: int, env_ids=None, step_size: float=1.):
+        if env_ids is None:
+            env_ids = ...
+
+        t = self.progress_buf[env_ids].unsqueeze(1) + step_size * torch.arange(steps, device=self.device)
+        t = self.traj_t0 + self.scale_time(self.traj_w[env_ids].unsqueeze(1) * t * self.dt)
+        traj_rot = self.traj_rot[env_ids].unsqueeze(1).expand(-1, t.shape[1], 4)
+        
+        target_pos = torch.vmap(self.lemniscate)(t, self.traj_c[env_ids])
+
+        # The problematic line
+        target_pos = torch.vmap(self.quat_rotate)(traj_rot, target_pos) * self.traj_scale[env_ids].unsqueeze(1)
+
+        crazyflie_pos_expanded = self._crazyflie_position.unsqueeze(0).unsqueeze(0)  # Shape becomes [1, 1, 3]
+        dynamic_target_pos = target_pos + crazyflie_pos_expanded  # Resulting shape will be [4096, 4, 3]
+
+        return dynamic_target_pos
+
     
     def calculate_metrics(self) -> None:
         root_positions = self.root_pos - self._env_pos
-        #root_positions[:, 0] -= 1
         root_quats = self.root_rot
-        root_vel = self.root_velocities[:, :3]
         root_angvels = self.root_velocities[:, 3:]
+
+        reward_distance_scale=2
+
+        target_dist = torch.norm(self.rpos[:, [0]], dim=-1)
+
+        pos_reward=torch.exp(-reward_distance_scale * target_dist).squeeze(-1)
+
+        target_dist = target_dist.squeeze(-1)
+        self.target_dist = target_dist
         self.root_positions = root_positions
-        #self.root_positions[:, 0] += 1
-
-        scaled_points, global_target_positions = self.target_position_spin(root_positions,0)
-        rotated_points_list = []
-        for i in range(4):
-            _, rotated_points = self.target_position_spin(root_positions, i)
-            rotated_points_list.append(rotated_points)
-
-        # Average the rotated points across the 4 steps
-        next_step = sum(rotated_points_list) / 4
-        radius=0.3
-        desired_speed_spin = 2*radius*math.pi / 3.5  # Setting desired speed as pi/3
-        current_speeds = torch.norm(root_vel, dim=1)  # Calculate the magnitudes of current velocities
-
-        target_dist_approach = torch.norm(root_positions - self.target_positions, dim=1)
-        global_target_dist = torch.norm(root_positions - global_target_positions, dim=1)
-
-        min_dist = torch.min(target_dist_approach, global_target_dist)
-        spin_start_condition = (min_dist> 0.2)
-        
-        self.target_dist=torch.where(spin_start_condition, 5*target_dist_approach,global_target_dist)
-        desired_speed_val=torch.ones_like(current_speeds)*desired_speed_spin
-        self.spin_start_step=torch.where(spin_start_condition, self.spin_start_step+1, self.spin_start_step)
-
-        spin_start_condition_alt=spin_start_condition.unsqueeze(-1)
-        next_step=torch.where(spin_start_condition_alt, self.target_positions, next_step)
-            
-        pos_reward = torch.exp(-3*self.target_dist)
 
         # orient reward
         ups = quat_axis(root_quats, 2)
         self.orient_z = ups[..., 2]
         up_reward = torch.clamp(ups[..., 2], min=0.0, max=1.0)
 
-        spin_factor= 1/ (2*math.pi/3.5)**2
-        spin = torch.square(root_angvels).sum(-1)
-        spin_reward = torch.exp(-spin_factor * spin)
-
         # effort reward
         effort = torch.square(self.actions).sum(-1)
         effort_reward = 0.05 * torch.exp(-0.5 * effort)
 
-        spin_completion_condition = (self.progress_buf - self.spin_start_step >= 700)
-        desired_speed=torch.where(spin_completion_condition,torch.zeros_like(current_speeds),desired_speed_val)
-
-        speed_diff = torch.abs(current_speeds - desired_speed)  # Calculate the absolute difference from the desired speed
-        traj = next_step - scaled_points
-
-        # Normalize root_vel and traj to unit vectors
-        norm_root_vel = root_vel / torch.norm(root_vel, dim=1, keepdim=True)
-        norm_traj = traj / torch.norm(traj, dim=1, keepdim=True)
-        # Calculate the dot product
-        dot_product = torch.sum(norm_root_vel * norm_traj, dim=1)
-        colinearity = 1 - dot_product
-
-        # Define the exponential reward
-        speed_reward = torch.exp(-3 * speed_diff)
-        coline_reward = torch.exp(-3 * colinearity)
+        # spin reward
+        spin = torch.square(root_angvels).sum(-1)
+        spin_reward = 0.01 * torch.exp(-1.0 * spin)
 
         # combined reward
-        self.rew_buf[:] = pos_reward + pos_reward * (up_reward + spin_reward) - effort_reward+speed_reward+coline_reward
-        
+        self.rew_buf[:] = pos_reward + pos_reward * (up_reward + spin_reward) - effort_reward
+
         # log episode reward sums
         self.episode_sums["rew_pos"] += pos_reward
         self.episode_sums["rew_orient"] += up_reward
         self.episode_sums["rew_effort"] += effort_reward
         self.episode_sums["rew_spin"] += spin_reward
-        self.episode_sums["rew_speed"] += speed_reward
-        self.episode_sums["rew_coline"] += coline_reward
 
         # log raw info
-        self.episode_sums["raw_dist"] += self.target_dist
+        self.episode_sums["raw_dist"] += target_dist
         self.episode_sums["raw_orient"] += ups[..., 2]
         self.episode_sums["raw_effort"] += effort
         self.episode_sums["raw_spin"] += spin
@@ -473,7 +493,7 @@ class CrazyflieTask(RLTask):
         # resets due to misbehavior
         ones = torch.ones_like(self.reset_buf)
         die = torch.zeros_like(self.reset_buf)
-        die = torch.where(self.target_dist > 5.0, ones, die)
+        die = torch.where(self.target_dist > 1, ones, die)
 
         # z >= 0.5 & z <= 5.0 & up > 0
         die = torch.where(self.root_positions[..., 2] < 0.5, ones, die)
