@@ -47,7 +47,7 @@ class CrazyflieTask(RLTask):
         self._num_observations = 18
         self._num_actions = 4
 
-        self._crazyflie_position = torch.tensor([0, 0, 2.3])
+        self._crazyflie_position = torch.tensor([0, 0, 2.0])
         self._ball_position = torch.tensor([0, 0, 1.0])
 
         RLTask.__init__(self, name=name, env=env)
@@ -123,7 +123,7 @@ class CrazyflieTask(RLTask):
         )
 
     def get_target(self):
-        radius = 0.2
+        radius = 0.01
         color = torch.tensor([1, 0, 0])
         ball = DynamicSphere(
             prim_path=self.default_zero_env_path + "/ball",
@@ -396,7 +396,7 @@ class CrazyflieTask(RLTask):
         # Average the rotated points across the 4 steps
         next_step = sum(rotated_points_list) / 4
 
-        target_dist = torch.norm(root_positions - global_target_positions, dim=1)
+        target_dist = torch.norm(root_positions - self.target_positions, dim=1)
         self.target_dist=target_dist
 
         pos_reward = torch.exp(-3*self.target_dist)
@@ -408,8 +408,7 @@ class CrazyflieTask(RLTask):
         norm_ups = ups / torch.norm(ups, dim=1, keepdim=True)
 
         cos_angle = torch.sum(norm_ups * norm_rot_target, dim=1)
-        coeff_rot=1-cos_angle
-        up_reward = torch.exp(-3*coeff_rot)
+        up_reward = cos_angle+1
 
         radius=0.3
         desired_speed = 2*radius*math.pi / 3.5
@@ -441,24 +440,27 @@ class CrazyflieTask(RLTask):
         yaw_penalty = torch.square(yaw_angvel - desired_yaw_angvel).sum(-1)
 
         y_angvel = root_angvels[:, 1]  # Y-axis angular velocity for spinning
-        desired_y_angvel = 2 * math.pi / 3.5  # Desired spin rate around Y-axis
+        desired_y_angvel = 2* math.pi / 3.5  # Desired spin rate around Y-axis
         y_angvel_diff = y_angvel - desired_y_angvel
         y_penalty = torch.square(y_angvel_diff).sum(-1)
 
         # Higher weight for Y-axis spin reward, lower weight for roll and yaw penalties to encourage minimal movements
-        combined_penalty = 0.1 * torch.exp(-1.0 * y_penalty) + 0.05 * torch.exp(-1.0 * roll_penalty) + 0.05 * torch.exp(-1.0 * yaw_penalty)
+        combined_penalty = torch.exp(-3.0 * y_penalty)
 
-        # Update spin_reward with the combined penalty
-        spin_reward = combined_penalty
+        angvel_target = torch.zeros((self._num_envs, 3), device=self._device, dtype=torch.float32)
+        angvel_target[:, 1] = 2* math.pi / 3.5 
+
+        spin = torch.square(root_angvels-angvel_target).sum(-1)
+        spin_reward = 10*torch.exp(-1.0 * spin)
 
         # combined reward
-        self.rew_buf[:] = (pos_reward +speed_reward+coline_reward)(1+up_reward+spin_reward) 
+        self.rew_buf[:] = (pos_reward)+(spin_reward)
         
         # log episode reward sums
         self.episode_sums["rew_pos"] += pos_reward
-        self.episode_sums["rew_orient"] += up_reward
-        self.episode_sums["rew_speed"] += speed_reward
-        self.episode_sums["rew_coline"] += coline_reward
+        #self.episode_sums["rew_orient"] += up_reward
+        #self.episode_sums["rew_speed"] += speed_reward
+        #self.episode_sums["rew_coline"] += coline_reward
         self.episode_sums["rew_spin"] += spin_reward
 
         # log raw info
@@ -472,7 +474,7 @@ class CrazyflieTask(RLTask):
         die = torch.where(self.target_dist > 10.0, ones, die)
 
         # z >= 0.5 & z <= 5.0 & up > 0
-        die = torch.where(self.root_positions[..., 2] < -2.0, ones, die)
+        die = torch.where(self.root_positions[..., 2] < 0.0, ones, die)
         die = torch.where(self.root_positions[..., 2] > 6.0, ones, die)
 
         # resets due to episode length
