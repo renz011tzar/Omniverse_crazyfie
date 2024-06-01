@@ -52,11 +52,11 @@ enable_recording: False
 # interval between video recordings (in steps)
 recording_interval: 2000
 # length of the recorded video (in steps)
-recording_length: 100
+recording_length: 900
 # fps for writing recorded video
 recording_fps: 30
 # directory to save recordings in
-recording_dir: ''
+recording_dir: '/home/renzo/recordings'
 
 wandb_activate: False
 wandb_group: ''
